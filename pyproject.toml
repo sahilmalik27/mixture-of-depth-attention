@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moda-attention"
+version = "0.1.0"
+description = "MoDA: Mixture-of-Depths Attention (arXiv:2603.15619)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5",
+]
+
+[project.optional-dependencies]
+triton = ["triton>=3.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-timeout>=2.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["moda*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
