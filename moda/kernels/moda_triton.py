@@ -1,7 +1,17 @@
-"""Triton kernel for MoDA attention (fused forward pass).
+"""Triton-accelerated MoDA attention (fused forward pass).
 
-Fuses sequence attention and depth attention into a single kernel using
-online softmax (Flash Attention style), so both phases share softmax state.
+Strategy: hybrid SDPA + fused depth Triton kernel.
+- Sequence phase: delegate to PyTorch SDPA (uses Flash/memory-efficient attention)
+  to get O_seq and LSE_seq.
+- Depth phase + combine: a single Triton kernel that computes depth attention
+  inline (per-layer iteration, no materialized score matrix) and combines with
+  sequence output using LSE-weighted fusion.
+
+Key optimizations:
+- Sequence phase runs at native SDPA speed
+- No GQA expansion for depth (handled in-kernel)
+- No intermediate tensors for depth scores/weights/output
+- Single Triton kernel for depth + combine (~L element-wise ops per query)
 """
 
 import torch
@@ -11,114 +21,198 @@ from typing import Optional
 try:
     import triton
     import triton.language as tl
+    HAS_TRITON = True
 except ImportError:
-    raise ImportError("Triton >= 3.0 required for moda_triton. Install with: pip install triton>=3.0")
+    HAS_TRITON = False
 
 
-@triton.jit
-def _moda_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr,
-    K_depth_ptr, V_depth_ptr,
-    O_ptr,
-    stride_qn, stride_qt, stride_qd,
-    stride_kn, stride_kt, stride_kd,
-    stride_vn, stride_vt, stride_vd,
-    stride_kdn, stride_kdt, stride_kdd,
-    stride_vdn, stride_vdt, stride_vdd,
-    stride_on, stride_ot, stride_od,
-    T: tl.constexpr, d: tl.constexpr, L: tl.constexpr,
-    scale,
-    BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """Fused MoDA forward kernel with online softmax.
+if HAS_TRITON:
+    @triton.jit
+    def _depth_fuse_kernel(
+        O_seq_ptr, LSE_seq_ptr,
+        Q_ptr, K_depth_ptr, V_depth_ptr,
+        O_ptr,
+        # O_seq strides [N, T, D] (flattened from [B, H_q, T, D] — may be non-contiguous)
+        stride_os_n, stride_os_t, stride_os_d,
+        # LSE_seq strides [N, T]
+        stride_ls_n, stride_ls_t,
+        # Q strides [B, H_q, T, D]
+        stride_q_b, stride_q_h, stride_q_t, stride_q_d,
+        # K_depth strides [B, H_k, T*L, D]
+        stride_kd_b, stride_kd_h, stride_kd_t, stride_kd_d,
+        # V_depth strides [B, H_k, T*L, D]
+        stride_vd_b, stride_vd_h, stride_vd_t, stride_vd_d,
+        # O strides [B, H_q, T, D]
+        stride_o_b, stride_o_h, stride_o_t, stride_o_d,
+        T: tl.constexpr,
+        D: tl.constexpr,
+        D_PAD: tl.constexpr,
+        L: tl.constexpr,
+        G: tl.constexpr,
+        scale,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Fused depth attention + sequence/depth combination.
 
-    Inputs are pre-expanded for GQA and reshaped to [N, T, d] where N = B*H_q.
-    Grid: (cdiv(T, BLOCK_Q), N)
-    """
-    pid_q = tl.program_id(0)
-    pid_n = tl.program_id(1)
+        For each query position, computes:
+        1. Depth attention via online softmax over L depth entries
+        2. LSE-weighted combination of O_seq (from SDPA) and O_depth
 
-    q_block_start = pid_q * BLOCK_Q
-    q_offsets = q_block_start + tl.arange(0, BLOCK_Q)
-    d_offsets = tl.arange(0, d)
+        Grid: (cdiv(T, BLOCK_T), B, H_q)
+        """
+        pid_t = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        pid_hq = tl.program_id(2)
+        pid_hkv = pid_hq // G
 
-    # Load Q block: [BLOCK_Q, d]
-    q_ptrs = Q_ptr + pid_n * stride_qn + q_offsets[:, None] * stride_qt + d_offsets[None, :] * stride_qd
-    q_mask = q_offsets[:, None] < T
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+        # Token offsets in this block
+        t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        d_offs = tl.arange(0, D_PAD)
+        t_mask = t_offs < T
+        d_mask = d_offs < D
+        td_mask = t_mask[:, None] & d_mask[None, :]
 
-    # Online softmax state
-    m = tl.full([BLOCK_Q], value=float("-inf"), dtype=tl.float32)
-    acc = tl.zeros([BLOCK_Q], dtype=tl.float32)
-    o = tl.zeros([BLOCK_Q, d], dtype=tl.float32)
+        # Flat index for O_seq/LSE_seq: n = pid_b * H_q + pid_hq
+        n_idx = pid_b * G * (stride_q_h // stride_q_h) + pid_hq  # simplified: use strides
+        # Actually compute from O_seq which is [B, H_q, T, D] possibly non-contiguous
+        # Use B*H_q indexing into flattened N dimension
+        # O_seq was reshaped as O_seq[b, hq, t, d]
+        # stride_os_n is stride for the flattened N = B*H_q dimension
 
-    # ========== Sequence phase (causal) ==========
-    for k_block_start in range(0, T, BLOCK_K):
-        k_offsets = k_block_start + tl.arange(0, BLOCK_K)
+        # Load O_seq: [BLOCK_T, D_PAD]
+        os_base = O_seq_ptr + pid_b * stride_os_n * tl.cdiv(stride_q_b, stride_q_h) + pid_hq * stride_os_n
+        # Simpler: use Q's B and H strides since O_seq has same logical layout
+        # Actually O_seq comes from SDPA and may have different strides.
+        # Let's use dedicated strides passed as [B, H_q, T, D]
+        # Redefine: stride_os_n = stride for batch dim, stride_os_t for head dim actually...
+        # This is getting complicated. Let me use 4D strides for O_seq too.
 
-        k_ptrs = K_ptr + pid_n * stride_kn + k_offsets[:, None] * stride_kt + d_offsets[None, :] * stride_kd
-        k_mask = k_offsets[:, None] < T
-        k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        # Load LSE_seq: [BLOCK_T]
+        lse_ptrs = LSE_seq_ptr + pid_b * stride_ls_n + pid_hq * stride_ls_t + t_offs
+        lse_seq = tl.load(lse_ptrs, mask=t_mask, other=float("-inf")).to(tl.float32)
 
-        # [BLOCK_Q, BLOCK_K]
-        s = tl.dot(q, tl.trans(k)) * scale
+        # Load Q: [BLOCK_T, D_PAD]
+        q_ptrs = (Q_ptr
+                  + pid_b * stride_q_b + pid_hq * stride_q_h
+                  + t_offs[:, None] * stride_q_t + d_offs[None, :] * stride_q_d)
+        q = tl.load(q_ptrs, mask=td_mask, other=0.0).to(tl.float32)
 
-        # Causal mask
-        causal = q_offsets[:, None] >= k_offsets[None, :]
-        valid = (q_offsets[:, None] < T) & (k_offsets[None, :] < T)
-        s = tl.where(causal & valid, s, float("-inf"))
+        # Load O_seq: [BLOCK_T, D_PAD]
+        os_ptrs = (O_seq_ptr
+                   + pid_b * stride_os_n + pid_hq * stride_os_t
+                   + t_offs[:, None] * stride_os_d + d_offs[None, :])
+        # Wait, this doesn't work with arbitrary strides. Let me use 4D strides for O_seq.
+        # I'll restructure to pass 4D strides for O_seq and 3D strides for LSE_seq.
+        os_ptrs_v2 = (O_seq_ptr
+                      + pid_b * stride_os_n + pid_hq * stride_os_t
+                      + t_offs[:, None] * stride_os_d + d_offs[None, :] * 1)
+        # Hmm, this needs proper stride computation. Let me just pass all strides explicitly.
+        pass
 
-        # Online softmax update
-        m_new = tl.maximum(m, tl.max(s, axis=1))
-        alpha = tl.exp(m - m_new)
-        p = tl.exp(s - m_new[:, None])
+    # The above kernel has stride issues. Let me use a cleaner approach.
 
-        v_ptrs = V_ptr + pid_n * stride_vn + k_offsets[:, None] * stride_vt + d_offsets[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+    @triton.jit
+    def _depth_combine_kernel(
+        O_seq_ptr, LSE_seq_ptr,
+        Q_ptr, K_depth_ptr, V_depth_ptr,
+        O_ptr,
+        # O_seq strides: [B, H_q, T, D] (4D)
+        stride_os_b, stride_os_h, stride_os_t, stride_os_d,
+        # LSE_seq strides: [B, H_q, T] (3D)
+        stride_ls_b, stride_ls_h, stride_ls_t,
+        # Q strides: [B, H_q, T, D]
+        stride_q_b, stride_q_h, stride_q_t, stride_q_d,
+        # K_depth strides: [B, H_k, T*L, D]
+        stride_kd_b, stride_kd_h, stride_kd_t, stride_kd_d,
+        # V_depth strides: [B, H_k, T*L, D]
+        stride_vd_b, stride_vd_h, stride_vd_t, stride_vd_d,
+        # O strides: [B, H_q, T, D]
+        stride_o_b, stride_o_h, stride_o_t, stride_o_d,
+        T: tl.constexpr,
+        D: tl.constexpr,
+        D_PAD: tl.constexpr,
+        L: tl.constexpr,
+        G: tl.constexpr,
+        scale,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Fused depth attention + LSE-weighted combination with sequence output.
 
-        o = o * alpha[:, None] + tl.dot(p, v)
-        acc = acc * alpha + tl.sum(p, axis=1)
-        m = m_new
+        Grid: (cdiv(T, BLOCK_T), B, H_q)
+        """
+        pid_t = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        pid_hq = tl.program_id(2)
+        pid_hkv = pid_hq // G
 
-    # ========== Depth phase ==========
-    depth_start = q_block_start * L
-    depth_len = BLOCK_Q * L
-    # Upper bound for valid entries
-    depth_end_val = tl.minimum((q_block_start + BLOCK_Q), T) * L
+        t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        d_offs = tl.arange(0, D_PAD)
+        t_mask = t_offs < T
+        d_mask = d_offs < D
+        td_mask = t_mask[:, None] & d_mask[None, :]
 
-    for d_block_start in range(0, depth_len, BLOCK_K):
-        d_abs_offsets = depth_start + d_block_start + tl.arange(0, BLOCK_K)
+        # Load Q: [BLOCK_T, D_PAD]
+        q_base = Q_ptr + pid_b * stride_q_b + pid_hq * stride_q_h
+        q_ptrs = q_base + t_offs[:, None] * stride_q_t + d_offs[None, :] * stride_q_d
+        q = tl.load(q_ptrs, mask=td_mask, other=0.0).to(tl.float32)
 
-        kd_ptrs = K_depth_ptr + pid_n * stride_kdn + d_abs_offsets[:, None] * stride_kdt + d_offsets[None, :] * stride_kdd
-        kd_mask = d_abs_offsets[:, None] < depth_end_val
-        kd = tl.load(kd_ptrs, mask=kd_mask, other=0.0).to(tl.float32)
+        # Depth attention via online softmax over L layers
+        m = tl.full([BLOCK_T], value=float("-inf"), dtype=tl.float32)
+        acc = tl.zeros([BLOCK_T], dtype=tl.float32)
+        o_depth = tl.zeros([BLOCK_T, D_PAD], dtype=tl.float32)
 
-        s = tl.dot(q, tl.trans(kd)) * scale
+        kd_base = K_depth_ptr + pid_b * stride_kd_b + pid_hkv * stride_kd_h
+        vd_base = V_depth_ptr + pid_b * stride_vd_b + pid_hkv * stride_vd_h
 
-        # Depth mask: query at pos i attends to depth entry j if i == floor(j/L)
-        d_token_pos = d_abs_offsets // L
-        depth_valid = (q_offsets[:, None] == d_token_pos[None, :])
-        bounds_valid = (q_offsets[:, None] < T) & (d_abs_offsets[None, :] < depth_end_val)
-        s = tl.where(depth_valid & bounds_valid, s, float("-inf"))
+        for l in range(L):
+            depth_idx = tl.where(t_mask, t_offs * L + l, 0)
 
-        m_new = tl.maximum(m, tl.max(s, axis=1))
-        alpha = tl.exp(m - m_new)
-        p = tl.exp(s - m_new[:, None])
+            # Load K_depth entry: [BLOCK_T, D_PAD]
+            kd_ptrs = kd_base + depth_idx[:, None] * stride_kd_t + d_offs[None, :] * stride_kd_d
+            kd = tl.load(kd_ptrs, mask=td_mask, other=0.0).to(tl.float32)
 
-        vd_ptrs = V_depth_ptr + pid_n * stride_vdn + d_abs_offsets[:, None] * stride_vdt + d_offsets[None, :] * stride_vdd
-        vd = tl.load(vd_ptrs, mask=kd_mask, other=0.0).to(tl.float32)
+            # Per-query dot product
+            score = tl.sum(q * kd, axis=1) * scale
+            score = tl.where(t_mask, score, float("-inf"))
 
-        o = o * alpha[:, None] + tl.dot(p, vd)
-        acc = acc * alpha + tl.sum(p, axis=1)
-        m = m_new
+            # Load V_depth entry: [BLOCK_T, D_PAD]
+            vd_ptrs = vd_base + depth_idx[:, None] * stride_vd_t + d_offs[None, :] * stride_vd_d
+            vd = tl.load(vd_ptrs, mask=td_mask, other=0.0).to(tl.float32)
 
-    # Normalize
-    o = o / acc[:, None]
+            # Online softmax update
+            m_new = tl.maximum(m, score)
+            alpha = tl.exp(m - m_new)
+            p = tl.exp(score - m_new)
 
-    # Store
-    o_ptrs = O_ptr + pid_n * stride_on + q_offsets[:, None] * stride_ot + d_offsets[None, :] * stride_od
-    o_mask = q_offsets[:, None] < T
-    tl.store(o_ptrs, o, mask=o_mask)
+            o_depth = o_depth * alpha[:, None] + p[:, None] * vd
+            acc = acc * alpha + p
+            m = m_new
+
+        # Normalize depth output and compute LSE
+        o_depth = o_depth / acc[:, None]
+        lse_depth = m + tl.log(acc)
+
+        # Load sequence output and LSE
+        os_base = O_seq_ptr + pid_b * stride_os_b + pid_hq * stride_os_h
+        os_ptrs = os_base + t_offs[:, None] * stride_os_t + d_offs[None, :] * stride_os_d
+        o_seq = tl.load(os_ptrs, mask=td_mask, other=0.0).to(tl.float32)
+
+        ls_base = LSE_seq_ptr + pid_b * stride_ls_b + pid_hq * stride_ls_h
+        ls_ptrs = ls_base + t_offs * stride_ls_t
+        lse_seq = tl.load(ls_ptrs, mask=t_mask, other=float("-inf")).to(tl.float32)
+
+        # LSE-weighted combination
+        M = tl.maximum(lse_seq, lse_depth)
+        w_s = tl.exp(lse_seq - M)
+        w_d = tl.exp(lse_depth - M)
+        denom = w_s + w_d
+
+        o_out = (w_s[:, None] * o_seq + w_d[:, None] * o_depth) / denom[:, None]
+
+        # Store
+        o_base = O_ptr + pid_b * stride_o_b + pid_hq * stride_o_h
+        o_ptrs = o_base + t_offs[:, None] * stride_o_t + d_offs[None, :] * stride_o_d
+        tl.store(o_ptrs, o_out, mask=td_mask)
 
 
 def moda_attention_triton(
@@ -131,9 +225,13 @@ def moda_attention_triton(
     scale: Optional[float] = None,
     chunk_size: Optional[int] = None,
 ) -> Tensor:
-    """MoDA attention using fused Triton kernel.
+    """MoDA attention: hybrid SDPA + fused depth Triton kernel.
 
     Same interface as moda_attention_naive. Inputs must be on CUDA.
+
+    Strategy:
+    1. Sequence attention via SDPA -> O_seq, LSE_seq
+    2. Fused Triton kernel: depth attention + LSE-weighted combination
 
     Args:
         Q: [B, H_q, T, d] queries.
@@ -143,7 +241,7 @@ def moda_attention_triton(
         V_depth: [B, H_k, T*L, d] depth values.
         num_layers: Number of layers (L).
         scale: Attention scale. Defaults to 1/sqrt(d).
-        chunk_size: Unused (chunking is implicit in the kernel).
+        chunk_size: Unused (kept for API compatibility).
 
     Returns:
         [B, H_q, T, d] output tensor.
@@ -156,43 +254,65 @@ def moda_attention_triton(
     if scale is None:
         scale = d ** -0.5
 
-    # Expand KV for GQA
-    if G > 1:
-        K = K.repeat_interleave(G, dim=1)
-        V = V.repeat_interleave(G, dim=1)
-        K_depth = K_depth.repeat_interleave(G, dim=1)
-        V_depth = V_depth.repeat_interleave(G, dim=1)
+    # ===== Phase 1: Sequence attention via SDPA =====
+    K_seq = K if G == 1 else K.repeat_interleave(G, dim=1)
+    V_seq = V if G == 1 else V.repeat_interleave(G, dim=1)
 
-    N = B * H_q
+    O_seq, lse_seq_raw, _, _ = torch.ops.aten._scaled_dot_product_efficient_attention(
+        Q, K_seq, V_seq, None, True, 0.0, True, scale=scale,
+    )
+    # LSE may be padded; trim to T
+    lse_seq = lse_seq_raw[:, :, :T]  # [B, H_q, T]
 
-    # Reshape to [N, T, d] / [N, T*L, d]
-    Q_flat = Q.reshape(N, T, d).contiguous()
-    K_flat = K.reshape(N, T, d).contiguous()
-    V_flat = V.reshape(N, T, d).contiguous()
-    K_depth_flat = K_depth.reshape(N, T * L, d).contiguous()
-    V_depth_flat = V_depth.reshape(N, T * L, d).contiguous()
+    if not HAS_TRITON:
+        # Fallback: PyTorch depth + combine
+        return _depth_combine_pytorch(Q, K_depth, V_depth, O_seq, lse_seq, L, G, scale)
 
-    O_flat = torch.empty_like(Q_flat)
+    # ===== Phase 2: Fused depth + combine (Triton) =====
+    O = torch.empty_like(Q)
+    D_PAD = max(16, triton.next_power_of_2(d))
+    BLOCK_T = max(16, min(128, triton.next_power_of_2(T)))
 
-    # Block sizes: tl.dot requires inner dim >= 16
-    BLOCK_Q = max(16, min(64, triton.next_power_of_2(T)))
-    BLOCK_K = max(16, min(64, triton.next_power_of_2(max(T, L))))
+    grid = (triton.cdiv(T, BLOCK_T), B, H_q)
 
-    grid = (triton.cdiv(T, BLOCK_Q), N)
+    # Ensure lse_seq is contiguous for the kernel
+    if not lse_seq.is_contiguous():
+        lse_seq = lse_seq.contiguous()
 
-    _moda_fwd_kernel[grid](
-        Q_flat, K_flat, V_flat,
-        K_depth_flat, V_depth_flat,
-        O_flat,
-        Q_flat.stride(0), Q_flat.stride(1), Q_flat.stride(2),
-        K_flat.stride(0), K_flat.stride(1), K_flat.stride(2),
-        V_flat.stride(0), V_flat.stride(1), V_flat.stride(2),
-        K_depth_flat.stride(0), K_depth_flat.stride(1), K_depth_flat.stride(2),
-        V_depth_flat.stride(0), V_depth_flat.stride(1), V_depth_flat.stride(2),
-        O_flat.stride(0), O_flat.stride(1), O_flat.stride(2),
-        T=T, d=d, L=L,
+    _depth_combine_kernel[grid](
+        O_seq, lse_seq,
+        Q, K_depth, V_depth,
+        O,
+        O_seq.stride(0), O_seq.stride(1), O_seq.stride(2), O_seq.stride(3),
+        lse_seq.stride(0), lse_seq.stride(1), lse_seq.stride(2),
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K_depth.stride(0), K_depth.stride(1), K_depth.stride(2), K_depth.stride(3),
+        V_depth.stride(0), V_depth.stride(1), V_depth.stride(2), V_depth.stride(3),
+        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+        T=T, D=d, D_PAD=D_PAD, L=L, G=G,
         scale=scale,
-        BLOCK_Q=BLOCK_Q, BLOCK_K=BLOCK_K,
+        BLOCK_T=BLOCK_T,
     )
 
-    return O_flat.reshape(B, H_q, T, d)
+    return O
+
+
+def _depth_combine_pytorch(Q, K_depth, V_depth, O_seq, lse_seq, L, G, scale):
+    """Fallback: depth attention + combine in pure PyTorch."""
+    B, H_q, T, d = Q.shape
+    H_k = H_q // G
+
+    K_depth_r = K_depth.reshape(B, H_k, T, L, d)
+    V_depth_r = V_depth.reshape(B, H_k, T, L, d)
+    Q_g = Q.reshape(B, H_k, G, T, d)
+
+    scores_depth = torch.einsum('bhgtd,bhtld->bhgtl', Q_g, K_depth_r) * scale
+    lse_depth = torch.logsumexp(scores_depth, dim=-1).reshape(B, H_q, T)
+    w_depth = torch.softmax(scores_depth, dim=-1)
+    O_depth = torch.einsum('bhgtl,bhtld->bhgtd', w_depth, V_depth_r).reshape(B, H_q, T, d)
+
+    M = torch.maximum(lse_seq, lse_depth)
+    w_s = torch.exp(lse_seq - M)
+    w_d = torch.exp(lse_depth - M)
+    denom = (w_s + w_d).unsqueeze(-1)
+    return (w_s.unsqueeze(-1) * O_seq + w_d.unsqueeze(-1) * O_depth) / denom

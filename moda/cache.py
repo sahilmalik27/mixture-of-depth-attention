@@ -69,11 +69,9 @@ class DepthKVCache:
         L = self.num_layers
 
         # For each token t, write at index t * L + layer_idx
-        indices = torch.arange(T, device=k_depth.device) * L + layer_idx
-        # indices: [T] -> expand for scatter: [1, 1, T, 1]
-        idx = indices.view(1, 1, T, 1).expand_as(k_depth[:, :, :T])
-        self.k_cache.scatter_(2, idx, k_depth[:, :, :T])
-        self.v_cache.scatter_(2, idx, v_depth[:, :, :T])
+        # Strided slice: positions [layer_idx, layer_idx+L, layer_idx+2L, ...]
+        self.k_cache[:, :, layer_idx:T * L:L, :] = k_depth[:, :, :T]
+        self.v_cache[:, :, layer_idx:T * L:L, :] = v_depth[:, :, :T]
 
     def read(self, seq_len: Optional[int] = None) -> tuple[Tensor, Tensor]:
         """Read depth KV cache for current sequence.

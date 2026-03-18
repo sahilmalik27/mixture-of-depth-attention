@@ -102,8 +102,8 @@ class MoDAAttention(nn.Module):
         return out, k_write, v_write
 
     def _standard_causal_attention(self, Q: Tensor, K: Tensor, V: Tensor) -> Tensor:
-        """Standard causal multi-head attention (no depth)."""
-        B, H_q, T, d = Q.shape
+        """Standard causal multi-head attention (no depth). Uses Flash Attention via SDPA."""
+        H_q = Q.shape[1]
         H_k = K.shape[1]
         G = H_q // H_k
 
@@ -111,10 +111,6 @@ class MoDAAttention(nn.Module):
             K = K.repeat_interleave(G, dim=1)
             V = V.repeat_interleave(G, dim=1)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=Q.device, dtype=torch.bool), diagonal=1
+        return torch.nn.functional.scaled_dot_product_attention(
+            Q, K, V, is_causal=True, scale=self.scale,
         )
-        scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-        weights = torch.softmax(scores, dim=-1)
-        return torch.matmul(weights, V)
