@@ -5,13 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "moda-attention"
 version = "0.1.0"
-description = "MoDA: Mixture-of-Depths Attention (arXiv:2603.15619)"
+description = "MoDA: Mixture-of-Depths Attention — drop-in attention replacement that lets transformers attend across depth (arXiv:2603.15619)"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
+authors = [
+    {name = "MoDA Contributors"},
+]
+keywords = ["attention", "transformer", "deep-learning", "pytorch", "triton", "moda", "depth-attention"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/sahilmalik27/mixture-of-depth-attention"
+Repository = "https://github.com/sahilmalik27/mixture-of-depth-attention"
+Issues = "https://github.com/sahilmalik27/mixture-of-depth-attention/issues"
 
 [project.optional-dependencies]
 triton = ["triton>=3.0"]
