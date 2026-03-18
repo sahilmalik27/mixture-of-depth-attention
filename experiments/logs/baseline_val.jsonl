@@ -1,0 +1,12 @@
+{"step": 100, "val_loss": 5.95949, "val_bpb": 8.59772, "timestamp": 1217.0}
+{"step": 200, "val_loss": 5.40945, "val_bpb": 7.80419, "timestamp": 2418.9}
+{"step": 300, "val_loss": 5.08224, "val_bpb": 7.33212, "timestamp": 3621.2}
+{"step": 400, "val_loss": 4.82848, "val_bpb": 6.96602, "timestamp": 4824.6}
+{"step": 500, "val_loss": 4.64783, "val_bpb": 6.7054, "timestamp": 6025.8}
+{"step": 600, "val_loss": 4.545, "val_bpb": 6.55704, "timestamp": 7230.0}
+{"step": 700, "val_loss": 4.39254, "val_bpb": 6.33709, "timestamp": 8431.0}
+{"step": 800, "val_loss": 4.29755, "val_bpb": 6.20005, "timestamp": 9634.1}
+{"step": 900, "val_loss": 4.17728, "val_bpb": 6.02653, "timestamp": 10834.7}
+{"step": 1000, "val_loss": 4.07771, "val_bpb": 5.8829, "timestamp": 12055.6}
+{"step": 1100, "val_loss": 3.97815, "val_bpb": 5.73925, "timestamp": 13259.6}
+{"step": 1196, "val_loss": 3.87645, "val_bpb": 5.59254, "timestamp": 14414.2}

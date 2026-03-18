@@ -1,3 +1,6 @@
 .venv/
 *.egg-info/
 __pycache__/
+experiments/EXPERIMENT.md
+dist/
+experiments/checkpoints/

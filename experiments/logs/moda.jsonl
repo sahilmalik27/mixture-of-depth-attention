@@ -1,0 +1,11 @@
+{"step": 10, "loss": 8.80928, "bpb": 12.7091, "lr": 3e-05, "tok_per_sec": 598, "timestamp": 1096.4}
+{"step": 20, "loss": 8.16092, "bpb": 11.77371, "lr": 6e-05, "tok_per_sec": 598, "timestamp": 2192.1}
+{"step": 30, "loss": 7.77808, "bpb": 11.2214, "lr": 9e-05, "tok_per_sec": 599, "timestamp": 3286.7}
+{"step": 40, "loss": 7.25464, "bpb": 10.46623, "lr": 0.00012, "tok_per_sec": 612, "timestamp": 4357.2}
+{"step": 50, "loss": 6.8766, "bpb": 9.92084, "lr": 0.00015, "tok_per_sec": 598, "timestamp": 5453.1}
+{"step": 60, "loss": 6.57753, "bpb": 9.48937, "lr": 0.00018, "tok_per_sec": 589, "timestamp": 6565.9}
+{"step": 70, "loss": 6.3639, "bpb": 9.18116, "lr": 0.00021, "tok_per_sec": 598, "timestamp": 7661.8}
+{"step": 80, "loss": 6.15489, "bpb": 8.87963, "lr": 0.00024, "tok_per_sec": 598, "timestamp": 8757.0}
+{"step": 90, "loss": 6.05519, "bpb": 8.73579, "lr": 0.00027, "tok_per_sec": 598, "timestamp": 9852.8}
+{"step": 100, "loss": 5.90794, "bpb": 8.52336, "lr": 0.0003, "tok_per_sec": 599, "timestamp": 10947.4}
+{"step": 110, "loss": 5.81067, "bpb": 8.38302, "lr": 0.00033, "tok_per_sec": 588, "timestamp": 12061.2}
