@@ -30,6 +30,11 @@ import pyarrow.parquet as pq
 # Add MoDA library
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from moda.kernels import moda_attention_naive
+try:
+    from moda.kernels import moda_attention_triton
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
 
 # ============================================================================
 # Model Architecture (125M Llama-style)
@@ -165,7 +170,8 @@ class MoDACausalSelfAttention(nn.Module):
         v = v.transpose(1, 2)
 
         if K_depth is not None and num_depth_layers > 0:
-            y = moda_attention_naive(
+            _moda_fn = moda_attention_triton if HAS_TRITON else moda_attention_naive
+            y = _moda_fn(
                 q, k, v, K_depth, V_depth,
                 num_layers=num_depth_layers,
                 scale=self.scale,
@@ -450,7 +456,7 @@ def main():
     WARMUP_STEPS = 200
     LOG_INTERVAL = 10
     EVAL_INTERVAL = 50 if args.mode == "moda" else 100
-    SAVE_INTERVAL = 500
+    SAVE_INTERVAL = 100
     EVAL_STEPS = 20
 
     # ---- Device setup ----

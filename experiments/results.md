@@ -1,119 +1,138 @@
-# A/B Experiment: MoDA vs Standard Attention
+# A/B Experiment Results: Baseline vs MoDA (125M GPT)
 
-## Setup
-
-Two identical 125M parameter GPT models trained on the same data, same hyperparameters — one with standard causal attention (baseline), one with MoDA (depth attention from all preceding layers).
-
-| Config | Value |
-|--------|-------|
-| Parameters | ~125M (12 layers, dim 768, 12 heads, 4 KV heads) |
-| Architecture | Llama-style (GQA, SwiGLU, RoPE, RMSNorm) |
-| Vocab size | 8,192 (BPE) |
-| Sequence length | 2,048 |
-| Batch size | 32 effective (8 × 4 grad accum) |
-| Learning rate | 6e-4 (cosine decay, 200 step warmup) |
-| Precision | bf16 mixed |
-| Data | ClimbMix-400B (web + book + code) |
-| Hardware | Single NVIDIA GB10 GPU |
-| MoDA config | chunk_size=64, post_norm=True |
-
-## Results
-
-### Training Progress
-
-**Baseline** ran for 1,196 steps (~4 hours, 5,440 tok/s).
-**MoDA** ran for 110 steps (~3.3 hours, 598 tok/s).
-
-### Head-to-Head at Step 100
-
-| Metric | Baseline | MoDA | Δ |
-|--------|----------|------|---|
-| Val BPB | 8.598 | **8.579** | **-0.018** |
-| Val Loss | 5.960 | 5.947 | -0.013 |
-
-MoDA shows a marginal quality advantage per step — the model benefits from attending to earlier layer representations even at step 100.
-
-### Best Achieved (full run)
+## Summary
 
 | Metric | Baseline | MoDA |
 |--------|----------|------|
-| Steps | 1,196 | 110 |
-| Best val BPB | **5.593** | 8.579 |
-| Final train BPB | 5.672 | 8.383 |
-| Throughput | **5,440 tok/s** | 598 tok/s |
+| Total steps | 3050 | 1950 |
+| Best val_bpb | 4.7694 | 5.8391 |
+| Best val_bpb step | 3000 | 1900 |
+| Final val_bpb | 4.7694 | 5.8552 |
+| Final train_bpb | 4.9422 | 5.9260 |
+| Avg tok/sec | 3777.3446 | 2805.9786 |
+| Training hours | 12.6739 | 12.6573 |
 
-### Validation BPB Curves
+## Validation BPB Curve (common steps)
 
-**Baseline:**
-| Step | Val BPB |
+| Step | Baseline val_bpb | MoDA val_bpb | Delta |
+|------|-----------------|-------------|-------|
+| 100 | 8.5965 | 8.6087 | +0.0122 |
+| 200 | 7.7816 | 8.1146 | +0.3330 |
+| 300 | 7.3347 | 7.8723 | +0.5376 |
+| 400 | 6.9642 | 7.5509 | +0.5867 |
+| 500 | 6.6951 | 7.2521 | +0.5571 |
+| 600 | 6.4963 | 7.0492 | +0.5529 |
+| 700 | 6.3480 | 6.7897 | +0.4417 |
+| 800 | 6.2164 | 6.6314 | +0.4150 |
+| 900 | 6.0449 | 6.4833 | +0.4385 |
+| 1000 | 5.9028 | 6.3751 | +0.4723 |
+| 1100 | 5.7482 | 6.3483 | +0.6000 |
+| 1200 | 5.5525 | 6.2774 | +0.7249 |
+| 1300 | 5.4557 | 6.1789 | +0.7233 |
+| 1400 | 5.3379 | 6.1031 | +0.7652 |
+| 1500 | 5.2664 | 6.0220 | +0.7555 |
+| 1600 | 5.2415 | 5.9762 | +0.7347 |
+| 1700 | 5.1802 | 5.9182 | +0.7380 |
+| 1800 | 5.1193 | 5.8823 | +0.7630 |
+| 1900 | 5.0782 | 5.8391 | +0.7609 |
+
+## Throughput
+
+- Baseline: **3,777** tok/sec
+- MoDA: **2,806** tok/sec
+- MoDA overhead: **25.7%** slower
+
+## Token Efficiency
+
+MoDA processes fewer tokens per step due to depth attention overhead,
+so the key question is whether it achieves better val_bpb *per step*.
+
+At step 1900: MoDA val_bpb (5.8391) > Baseline (5.0782) — 
+Baseline is more efficient per gradient step.
+
+## All Baseline Validation Points
+
+| Step | val_bpb |
 |------|---------|
-| 100 | 8.598 |
-| 200 | 7.972 |
-| 300 | 7.402 |
-| 400 | 6.972 |
-| 500 | 6.815 |
-| 600 | 6.555 |
-| 700 | 6.367 |
-| 800 | 6.200 |
-| 900 | 6.027 |
-| 1000 | 5.883 |
-| 1100 | 5.761 |
-| 1196 | 5.593 |
+| 100 | 8.5965 |
+| 200 | 7.7816 |
+| 300 | 7.3347 |
+| 400 | 6.9642 |
+| 500 | 6.6951 |
+| 600 | 6.5451 |
+| 600 | 6.4963 |
+| 700 | 6.3480 |
+| 800 | 6.2164 |
+| 900 | 6.0449 |
+| 1000 | 5.9028 |
+| 1100 | 5.7482 |
+| 1200 | 5.5525 |
+| 1300 | 5.4557 |
+| 1400 | 5.3379 |
+| 1500 | 5.2664 |
+| 1600 | 5.2415 |
+| 1700 | 5.1802 |
+| 1800 | 5.1193 |
+| 1900 | 5.0782 |
+| 2000 | 5.0153 |
+| 2100 | 4.9929 |
+| 2200 | 4.9429 |
+| 2300 | 4.9340 |
+| 2400 | 4.8907 |
+| 2500 | 4.8772 |
+| 2600 | 4.8441 |
+| 2700 | 4.8604 |
+| 2800 | 4.8185 |
+| 2900 | 4.8180 |
+| 3000 | 4.7694 |
 
-**MoDA:**
-| Step | Val BPB |
+## All MoDA Validation Points
+
+| Step | val_bpb |
 |------|---------|
-| 50 | 9.783 |
-| 100 | 8.579 |
-
-## Analysis
-
-### Per-Step Quality
-MoDA shows a slight quality advantage at equal step counts (-0.018 BPB at step 100). This is consistent with the paper's claim that depth attention preserves signal from earlier layers. However, the signal is small at this early stage — the paper's +2.11% downstream improvement was measured at 100B tokens on a 1.5B model, far beyond our 110-step run.
-
-### Throughput Gap
-The critical finding: **MoDA with the naive PyTorch kernel runs 9.1x slower** than standard attention. The paper claims only 3.7% FLOPs overhead, but this assumes a fused Triton kernel with:
-
-1. **Online softmax** — our naive impl materializes the full combined score matrix
-2. **Chunk-aware memory access** — naive impl doesn't exploit locality
-3. **No intermediate tensors** — naive impl creates multiple temporary tensors per layer
-
-The throughput gap means that at equal wall-clock time, baseline trains ~10x more steps and reaches much lower BPB.
-
-### Wall-Clock Efficiency
-At 4 hours:
-- Baseline: step 1,196, val BPB **5.593**
-- MoDA: step ~110, val BPB **8.579**
-
-Baseline wins decisively on wall-clock efficiency with the naive kernel.
-
-### What This Means
-
-1. **MoDA's quality claim has weak supporting evidence** in our experiment — a -0.018 BPB improvement at step 100 is directionally positive but not statistically significant.
-
-2. **The fused Triton kernel is critical** for MoDA to be practical. Without it, the depth KV cache overhead dominates training time.
-
-3. **Longer runs needed** to see if MoDA's per-step advantage compounds. The paper trained for 100B tokens; we trained for ~7M tokens with MoDA.
-
-## Reproducing
-
-```bash
-# Install dependencies
-pip install moda-attention torch
-
-# Run baseline (4 hours)
-python experiments/train_ab.py --mode baseline --max-hours 4
-
-# Run MoDA (4 hours)
-python experiments/train_ab.py --mode moda --max-hours 4
-
-# Generate comparison
-python experiments/compare.py
-```
-
-## Next Steps
-
-- Benchmark the fused Triton kernel to close the throughput gap
-- Run longer MoDA training (1000+ steps) for meaningful BPB comparison
-- Profile memory: depth KV cache scales as O(T × L × d) per token
-- Test with larger models where depth signal degradation is more pronounced
+| 50 | 9.7467 |
+| 100 | 8.6085 |
+| 150 | 8.2125 |
+| 200 | 8.1144 |
+| 250 | 7.9530 |
+| 300 | 7.8672 |
+| 350 | 7.6785 |
+| 50 | 9.7470 |
+| 100 | 8.6087 |
+| 150 | 8.2120 |
+| 200 | 8.1146 |
+| 250 | 7.9547 |
+| 300 | 7.8723 |
+| 350 | 7.6817 |
+| 400 | 7.5509 |
+| 450 | 7.3922 |
+| 500 | 7.2521 |
+| 550 | 7.1734 |
+| 600 | 7.0492 |
+| 650 | 6.8953 |
+| 700 | 6.7897 |
+| 750 | 6.6983 |
+| 800 | 6.6314 |
+| 850 | 6.5390 |
+| 900 | 6.4833 |
+| 950 | 6.4368 |
+| 1000 | 6.3751 |
+| 1050 | 6.3223 |
+| 1100 | 6.3483 |
+| 1150 | 6.2544 |
+| 1200 | 6.2774 |
+| 1250 | 6.1845 |
+| 1300 | 6.1789 |
+| 1350 | 6.1275 |
+| 1400 | 6.1031 |
+| 1450 | 6.0943 |
+| 1500 | 6.0220 |
+| 1550 | 6.0343 |
+| 1600 | 5.9762 |
+| 1650 | 5.9822 |
+| 1700 | 5.9182 |
+| 1750 | 5.9211 |
+| 1800 | 5.8823 |
+| 1850 | 5.8946 |
+| 1900 | 5.8391 |
+| 1950 | 5.8552 |
